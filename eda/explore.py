@@ -4,7 +4,7 @@
     python eda/explore.py --no-live  # skip live tables
 
 Read-only: every aggregation runs as SQL in RawTree, Python only plots.
-Outputs: CSVs in eda/out/, PNG charts in eda/plots/.
+Outputs: CSVs in eda/out/, one interactive figure per section (nothing stored).
 """
 from __future__ import annotations
 
@@ -13,8 +13,6 @@ import sys
 import time
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -22,7 +20,6 @@ import requests
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = Path(__file__).resolve().parent / "out"
-PLOTS = Path(__file__).resolve().parent / "plots"
 
 for line in (ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists() else []:
     key, _, value = line.partition("=")
@@ -101,7 +98,7 @@ def catalogue() -> None:
     b.get_legend().remove() if b.get_legend() else None
     a.axis("off")
 
-    fig.savefig(PLOTS / "catalog.png", dpi=120)
+# interactive figure: shown by plt.show() at the end of the run
 
 
 def sessions() -> None:
@@ -162,7 +159,7 @@ def sessions() -> None:
     a.set_xlabel("products already viewed this session")
     a.set_title("D · Conversion % by session depth (labels: #requests)")
 
-    fig.savefig(PLOTS / "history_sessions.png", dpi=120)
+# interactive figure: shown by plt.show() at the end of the run
 
 
 def events() -> None:
@@ -218,7 +215,7 @@ def events() -> None:
     a.set_xlabel("price (EUR, 10€ buckets)")
     a.set_title("D · Price distribution per event: buyers skew chea­per\n(p50 view €28.99 → purchase €23.99)")
 
-    fig.savefig(PLOTS / "history_events.png", dpi=120)
+# interactive figure: shown by plt.show() at the end of the run
 
 
 def live() -> None:
@@ -271,7 +268,7 @@ def live() -> None:
     a.set_xlabel("views last 30 min ÷ avg views per 30 min (previous 3 h)")
     a.set_title("D · Trending subcategories RIGHT NOW — chase these in the final round")
 
-    fig.savefig(PLOTS / "live.png", dpi=120)
+# interactive figure: shown by plt.show() at the end of the run
 
 
 SECTIONS = [catalogue, sessions, events, live]
@@ -281,7 +278,6 @@ def main() -> None:
     args = sys.argv[1:]
     only = [a for a in args if not a.startswith("--")]
     OUT.mkdir(exist_ok=True)
-    PLOTS.mkdir(exist_ok=True)
     for fn in SECTIONS:
         if fn is live and "--no-live" in args:
             continue
@@ -294,6 +290,7 @@ def main() -> None:
             print(f"  done in {time.time() - t:.1f}s")
         except Exception as e:
             print(f"  SKIPPED ({e})")
+    plt.show()
 
 
 if __name__ == "__main__":
