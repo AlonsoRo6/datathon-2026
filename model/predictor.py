@@ -54,6 +54,13 @@ FROM (
 )
 GROUP BY product_id"""
 
+CATALOG_WM_SQL = """
+SELECT toString(max(ts)) AS wm
+FROM shop.catalog_updates
+WHERE ts > toDateTime64('{since}', 3)"""
+"""Newest catalogue update after a watermark: one tiny query that tells
+refresh() whether the full catalogue re-fetch is worth doing at all."""
+
 TRENDS_SQL = """
 SELECT product_id::String AS product_id,
        countIf(event_type::String='view') AS views_24h,
@@ -76,7 +83,7 @@ class Predictor:
             import lightgbm as lgb
             self.model = lgb.Booster(model_file=str(lgb_path))
             self.backend = "lightgbm"
-            self.VERSION = "pchavarria-v1"
+            self.VERSION = "pchavarria-v2"
         else:
             self.model = joblib.load(d / "model.joblib")
             self.backend = "sklearn-histgb"
@@ -107,13 +114,33 @@ class Predictor:
             for c, g in self.fs.products.groupby("category")}
         self.active = set(active.product_id)
         self._active_list = active.product_id.tolist()
+        self._cat_wm = self._max_update_ts()
+
+    def _max_update_ts(self) -> str:
+        """Newest shop.catalog_updates timestamp, as watermark for refresh().
+        Returns the epoch on failure, which just forces a rebuild next time."""
+        try:
+            r = self._http.post(f"{self._api}/v1/query", json={"sql": "SELECT toString(max(ts)) AS wm FROM shop.catalog_updates"}, timeout=10)
+            r.raise_for_status()
+            return r.json()["data"][0]["wm"]
+        except Exception:
+            return "1970-01-01 00:00:00.000"
 
     def refresh(self) -> None:
-        """Cheap periodic refresh for long runs: re-fetch the catalogue (so new
-        products, prices and active flags rebuild best/cat_stars) and recompute
-        the trend list from the last 24 h of events against the historical
-        baseline. Call it every minute or so; catch exceptions in the caller."""
-        self._live_catalog()
+        """Cheap periodic refresh for long runs: the trend list is rebuilt from
+        the last 24 h of events, but the heavy catalogue re-fetch only happens
+        when catalog_updates actually has new rows (one watermark query). Call
+        it every minute or so; catch exceptions in the caller."""
+        try:
+            r = self._http.post(f"{self._api}/v1/query",
+                                json={"sql": CATALOG_WM_SQL.format(since=self._cat_wm)}, timeout=10)
+            r.raise_for_status()
+            wm = r.json()["data"][0]["wm"]
+        except Exception:
+            wm = None  # watermark lost: be safe and rebuild the catalogue
+        if wm is None or wm > self._cat_wm:
+            self._live_catalog()
+            self._cat_wm = wm if wm is not None else self._max_update_ts()
         r = self._http.post(f"{self._api}/v1/query", json={"sql": TRENDS_SQL}, timeout=60)
         r.raise_for_status()
         live = pd.DataFrame(r.json()["data"])

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -47,9 +48,11 @@ GROUP BY product_id"""
 NEW_REQUESTS = """
 SELECT request_id, ts, user_id, is_new_user, context, recent_views
 FROM shop.requests
+WHERE ts > now() - INTERVAL 2 MINUTE
 ORDER BY ts DESC
-LIMIT 50"""
-"""The 50 most recent recommendation requests, newest first."""
+LIMIT 200"""
+"""Recent unanswered candidates. The 2-minute window keeps the scan cheap all
+weekend; 200 rows absorb arrival bursts that a 50-row window would miss."""
 
 OUT_OF_STOCK = """
 SELECT product_id::String AS product_id
@@ -57,7 +60,17 @@ FROM shop.catalog_updates
 WHERE change::String IN ('out_of_stock', 'back_in_stock')
 GROUP BY product_id
 HAVING argMax(change::String, ts::DateTime64(3)) = 'out_of_stock'"""
-"""Products whose latest stock change is a stock-out."""
+"""Products whose latest stock change is a stock-out. Used once at startup
+and as fallback; afterwards deltas keep the set current (see StockTracker)."""
+
+STOCK_DELTA = """
+SELECT product_id::String AS product_id, change::String AS change, toString(ts) AS ts
+FROM shop.catalog_updates
+WHERE ts > toDateTime64('{since}', 3) AND change::String IN ('out_of_stock', 'back_in_stock')
+ORDER BY ts"""
+"""Stock changes since a watermark timestamp. Applying a handful of rows is
+much cheaper than re-scanning the whole update log every second, and the set
+reacts to 'back_in_stock' within a second (fewer invalid answers)."""
 
 Record = dict[str, Any]
 """RawTree returns rows as JSON objects: {"column": value, ...}"""
@@ -83,6 +96,42 @@ def best_sellers(until: str | None = None) -> list[str]:
 def out_of_stock() -> set[str]:
     """Products out of stock right now. Recommending one makes the whole answer invalid."""
     return {r["product_id"] for r in query(OUT_OF_STOCK)}
+
+
+class StockTracker:
+    """Keeps a shared dict's 'unavailable' set current via watermark deltas.
+
+    Seeds once with a full scan, then applies only the new stock changes each
+    second; any failure falls back to a full re-seed, so correctness never
+    depends on the delta path."""
+
+    def __init__(self, state: dict) -> None:
+        """One full scan + remember the newest update timestamp as watermark."""
+        self.state = state
+        self.reseed()
+
+    def reseed(self) -> None:
+        """Full scan (also the fallback after any delta error)."""
+        self.state["unavailable"] = out_of_stock()
+        self.since = query("SELECT toString(max(ts)) AS wm FROM shop.catalog_updates")[0]["wm"]
+
+    def update(self) -> None:
+        """Apply the stock changes since the last watermark."""
+        try:
+            rows = query(STOCK_DELTA.format(since=self.since))
+        except Exception as e:
+            print(f"stock delta failed ({e}); full re-seed")
+            try:
+                self.reseed()
+            except Exception as e2:
+                print(f"stock re-seed failed: {e2}")
+            return
+        if rows:
+            u = set(self.state["unavailable"])
+            for r in rows:
+                (u.add if r["change"] == "out_of_stock" else u.discard)(r["product_id"])
+            self.state["unavailable"] = u
+            self.since = rows[-1]["ts"]
 
 
 def pull(seen: set[str]) -> list[Record]:
@@ -126,37 +175,51 @@ def push(answers: list[Record]) -> None:
     print(f"answered {len(answers)}")
 
 
+CHUNK = 10
+"""Answers are predicted and pushed in chunks of this size, so the first
+requests of a poll never wait for the featurizing of the last ones."""
+
+
+def maintainer(state: dict) -> None:
+    """Background thread for the queries that do not have to block answering:
+    the stock set (watermark deltas, every second) and the model's catalogue /
+    trend signals (every minute). Failures keep the last known values; the
+    answering loop only ever reads the shared dict."""
+    signal_t = 0.0
+    stock = StockTracker(state)
+    while True:
+        now = time.time()
+        stock.update()
+        try:
+            if _pred is not None and now - signal_t >= 60:
+                signal_t = now
+                _pred.refresh()
+        except Exception as e:
+            print(f"signal refresh failed ({e}); keeping last known signals")
+        time.sleep(0.2)
+
+
 def main() -> None:
-    """pull → predict → push forever. Stock is re-checked every second, the
-    model's catalogue/trend signals every minute (best-effort, never fatal)."""
+    """pull → predict → push forever. All RawTree maintenance (stock, catalogue,
+    trends) runs in a background thread, so the only thing the answering loop
+    ever waits for is predicting and pushing the chunk it is holding."""
     best: list[str] = []
     seen = set[str]()
-    unavailable: set[str] = set()
-    stock_checked = 0.0
-    signals_checked = time.time()
+    state = {"unavailable": set[str]()}
+    threading.Thread(target=maintainer, args=(state,), daemon=True).start()
     while True:
         try:
             if not best:
                 best = best_sellers()
-            if time.time() - stock_checked >= 1:  # stock changes every few minutes: once a second is plenty
-                stock_checked = time.time()
-                try:
-                    unavailable = out_of_stock()
-                except Exception as e:  # keep answering with the last known stock
-                    print(f"stock check failed: {e}")
-            if _pred is not None and time.time() - signals_checked >= 60:
-                signals_checked = time.time()
-                try:
-                    _pred.refresh()  # fresh prices/active flags/trends for long runs
-                except Exception as e:
-                    print(f"signal refresh failed ({e}); keeping last known signals")
-            answers = predict(pull(seen), best, unavailable)
-            if answers:
-                push(answers)
+            reqs = pull(seen)
+            for i in range(0, len(reqs), CHUNK):
+                answers = predict(reqs[i:i + CHUNK], best, state["unavailable"])
+                if answers:
+                    push(answers)
         except Exception as e:  # keep running: shoppers keep arriving while you sleep
             print(f"error: {e}")
             time.sleep(2)
-        time.sleep(0.3)
+        time.sleep(0.1)
 
 
 if __name__ == "__main__":
