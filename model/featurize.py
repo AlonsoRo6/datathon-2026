@@ -47,6 +47,12 @@ class FeatureStore:
     best: list = field(default_factory=list, init=False)
     cat_stars: dict = field(default_factory=dict, init=False)
     trend: list = field(default_factory=list, init=False)
+    pidx: pd.DataFrame = field(default_factory=pd.DataFrame, init=False)
+    """products indexed by product_id: built once at load time and reused by
+    every scoring component instead of rebuilding the index per request."""
+    trends: pd.DataFrame = field(default_factory=pd.DataFrame, init=False)
+    """Full trends_product table, kept around so the live trend list can be
+    rebuilt periodically against the historical baseline.""" 
 
     @classmethod
     def load(cls) -> FeatureStore:
@@ -69,12 +75,15 @@ class FeatureStore:
         fs.best = ps.sort_values("purchases", ascending=False).product_id.tolist()
         fs.cat_stars = {c: g.sort_values("purchases", ascending=False).product_id.head(40).tolist()
                         for c, g in ps.groupby("category")}
-        t = rd("trends_product").sort_values("purchase_lift", ascending=False)
+        fs.trends = rd("trends_product")
+        t = fs.trends.sort_values("purchase_lift", ascending=False)
         fs.trend = t[t.views_24h >= 20].product_id.head(120).tolist()
+        fs.pidx = fs.products.set_index("product_id")
         return fs
 
 
 def session_base(reqs: pd.DataFrame, fs: FeatureStore) -> pd.DataFrame:
+    """One row of per-request context features (pages, hour, user stats, ...)."""
     s = pd.DataFrame(index=reqs.index)
     s["page"] = reqs["page"].astype(str)
     s["device"] = reqs["device"].astype(str)
@@ -105,13 +114,15 @@ def session_base(reqs: pd.DataFrame, fs: FeatureStore) -> pd.DataFrame:
     s["ctx_page_device"] = pd.Series([fs.ctx_pd.get((p, d), np.nan) for p, d in zip(s.page, s.device)],
                                      index=s.index, dtype="float32")
     s["ctx_page_lastcat"] = pd.Series([fs.ctx_plc.get((p, str(c))) for p, c in zip(s.page, s.last_view_cat)],
-                                      index=s.index, dtype="float32")
+                                     index=s.index, dtype="float32")
     s["recent_ids"] = reqs["recent_ids"]
     return s
 
 
 def attach_candidates(base: pd.DataFrame, slots: pd.DataFrame, fs: FeatureStore) -> pd.DataFrame:
-    ps = fs.products.set_index("product_id")
+    """Join candidate-level features (product stats, co-views, text cosine)
+    onto every (request, candidate) slot."""
+    ps = fs.pidx
     df = slots.reset_index(drop=True).merge(base.reset_index(names="rid"),
                                             left_on="request_id", right_on="rid", how="left")
     j = df.merge(ps[["category", "subcategory", "brand", "price", "purchase_rate", "cart_rate",
@@ -152,6 +163,8 @@ def attach_candidates(base: pd.DataFrame, slots: pd.DataFrame, fs: FeatureStore)
 
 
 def _text_cos(j: pd.DataFrame, fs: FeatureStore) -> np.ndarray:
+    """TF-IDF cosine similarity between each candidate and the last viewed
+    product, computed per unique last-view to reuse sparse products."""
     out = np.full(len(j), np.nan, dtype="float32")
     cand_rows = j.pid.map(fs.pid_row).to_numpy(dtype="float64")
     lv_rows = pd.Series(j.last_view.to_numpy()).map(fs.pid_row).to_numpy(dtype="float64")
@@ -176,6 +189,8 @@ def _text_cos(j: pd.DataFrame, fs: FeatureStore) -> np.ndarray:
 
 
 def feature_matrix(j: pd.DataFrame, cats: dict[str, list[str]]) -> pd.DataFrame:
+    """Model input: numeric columns as float32, categoricals restricted to the
+    training-time category lists from meta.json."""
     out = j[NUMERIC].astype("float32").copy()
     for c in CATEGORICAL:
         v = pd.Series(j[c].to_numpy(), dtype=object)

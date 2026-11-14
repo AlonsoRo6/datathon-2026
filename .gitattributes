@@ -1,0 +1,4 @@
+# Model/feature artifacts must never have their line endings converted:
+# LightGBM's text model parser crashes on CRLF.
+model/out/** binary
+features/out/** binary

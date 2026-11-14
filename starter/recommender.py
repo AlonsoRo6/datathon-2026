@@ -127,10 +127,13 @@ def push(answers: list[Record]) -> None:
 
 
 def main() -> None:
+    """pull → predict → push forever. Stock is re-checked every second, the
+    model's catalogue/trend signals every minute (best-effort, never fatal)."""
     best: list[str] = []
     seen = set[str]()
     unavailable: set[str] = set()
     stock_checked = 0.0
+    signals_checked = time.time()
     while True:
         try:
             if not best:
@@ -141,6 +144,12 @@ def main() -> None:
                     unavailable = out_of_stock()
                 except Exception as e:  # keep answering with the last known stock
                     print(f"stock check failed: {e}")
+            if _pred is not None and time.time() - signals_checked >= 60:
+                signals_checked = time.time()
+                try:
+                    _pred.refresh()  # fresh prices/active flags/trends for long runs
+                except Exception as e:
+                    print(f"signal refresh failed ({e}); keeping last known signals")
             answers = predict(pull(seen), best, unavailable)
             if answers:
                 push(answers)
