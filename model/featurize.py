@@ -47,6 +47,10 @@ class FeatureStore:
     best: list = field(default_factory=list, init=False)
     cat_stars: dict = field(default_factory=dict, init=False)
     trend: list = field(default_factory=list, init=False)
+    cov_live: dict = field(default_factory=dict, init=False)
+    """Live co-visitation from the last 24 h of shop.events (Predictor
+    .refresh_cov()): product -> neighbour -> count, used as an extra candidate
+    source so neighbourhoods track today's taste."""
     pidx: pd.DataFrame = field(default_factory=pd.DataFrame, init=False)
     """products indexed by product_id: built once at load time and reused by
     every scoring component instead of rebuilding the index per request."""

@@ -8,9 +8,15 @@ Candidate generation = co-view neighbours of the last viewed product + stars
 of the session's categories + live trending + a few random explorers + best
 sellers as filler. Feature assembly goes through model/featurize.py, the same
 code path used for training, so live rows look exactly like training rows.
-The catalogue is refreshed from RawTree at startup (catalog + catalog_updates)
-so new products and price changes are visible; refresh() redoes it together
-with the live trend list, call it periodically during long runs.
+
+Four background loops (call them from the serving thread, catch exceptions):
+  refresh()          catalogue + trends, gated by a watermark
+  refresh_cov()      today's co-visitation from live shop.events
+  refresh_feedback() empirical per-product conversion from YOUR OWN served
+                     traffic (team feedback), applied as a score multiplier
+  add_purchases()    keeps the already-bought exclusion current; shoppers
+                     who own a product rarely buy it again, so those slots
+                     are freed for buyable items.
 """
 from __future__ import annotations
 
@@ -36,6 +42,8 @@ for _line in (ROOT / ".env").read_text().splitlines() if (ROOT / ".env").exists(
 
 from model.featurize import FeatureStore, attach_candidates, feature_matrix, session_base
 
+TEAM = os.environ.get("TEAM_ID", "team_NN")
+
 CATALOG_SQL = """
 SELECT product_id::String AS product_id,
        argMax(category::String, v)    AS category,
@@ -55,11 +63,12 @@ FROM (
 GROUP BY product_id"""
 
 CATALOG_WM_SQL = """
-SELECT toString(max(ts)) AS wm
+SELECT count() AS n, max(ts::UInt64) AS mx
 FROM shop.catalog_updates
-WHERE ts > toDateTime64('{since}', 3)"""
-"""Newest catalogue update after a watermark: one tiny query that tells
-refresh() whether the full catalogue re-fetch is worth doing at all."""
+WHERE ts::UInt64 > {since}"""
+"""Whether any catalogue update exists after a watermark (epoch seconds;
+RawTree's ts is a String of unix seconds, so compare as integers): one tiny
+query that tells refresh() whether the full catalogue re-fetch is worth it."""
 
 TRENDS_SQL = """
 SELECT product_id::String AS product_id,
@@ -69,6 +78,51 @@ FROM shop.events
 WHERE ts > now() - INTERVAL 24 HOUR
 GROUP BY product_id"""
 """Last-24h view/purchase counts, the live half of the trend-lift ratio."""
+
+BOUGHT_SQL = """
+SELECT user_id::String AS user_id, groupUniqArray(product_id::String) AS pids
+FROM shop.history_events
+WHERE event_type::String = 'purchase'
+GROUP BY user_id"""
+"""Everything every shopper ever bought: the already-bought exclusion map."""
+
+LIVE_PURCHASES_SQL = """
+SELECT user_id::String AS user_id, product_id::String AS product_id, ts::UInt64 AS ts
+FROM shop.events
+WHERE ts::UInt64 >= {since} AND event_type::String = 'purchase'
+ORDER BY ts"""
+"""Live purchases since a watermark (epoch seconds), folded into the bought
+map; the >= re-delivery of the boundary second is harmless (set.add)."""
+
+CVR_SQL = """
+SELECT p::String AS product_id, count() AS shown, countIf(purchased != '') AS bought
+FROM (
+    SELECT arrayJoin(shown::Array(String)) AS p, purchased::String AS purchased
+    FROM {team}.feedback
+    WHERE request_id != '__init__' AND served_by::String = 'team'
+) GROUP BY product_id"""
+"""Exposure and purchases per product from OUR served traffic: the empirical
+side of the score multiplier."""
+
+LIVE_COV_SQL = """
+SELECT p::String AS p, q::String AS q, count() AS n
+FROM (
+    SELECT session_id::String AS sid, product_id::String AS p, ts::DateTime64(3) AS ts
+    FROM shop.events
+    WHERE event_type::String = 'view' AND ts::DateTime64(3) >= now() - INTERVAL 24 HOUR
+) a
+INNER JOIN (
+    SELECT session_id::String AS sid, product_id::String AS q, ts::DateTime64(3) AS ts
+    FROM shop.events
+    WHERE event_type::String = 'view' AND ts::DateTime64(3) >= now() - INTERVAL 24 HOUR
+) b ON a.sid = b.sid AND a.p != b.q
+WHERE a.ts <= b.ts
+GROUP BY p, q
+ORDER BY n DESC
+LIMIT 30 BY p"""
+"""Today's co-visitation, same directional pattern as the offline build
+(a viewed before b) but over the live stream, so neighbourhoods follow
+today's taste without retraining."""
 
 
 class Predictor:
@@ -83,7 +137,7 @@ class Predictor:
             import lightgbm as lgb
             self.model = lgb.Booster(model_file=str(lgb_path))
             self.backend = "lightgbm"
-            self.VERSION = "pchavarria-v2"
+            self.VERSION = "pchavarria-v4"
         else:
             self.model = joblib.load(d / "model.joblib")
             self.backend = "sklearn-histgb"
@@ -93,7 +147,10 @@ class Predictor:
         self._http = requests.Session()
         self._http.headers["Authorization"] = f"Bearer {os.environ['RAWTREE_API_KEY']}"
         self.rng = np.random.default_rng(0)
+        self.bought: dict[str, set[str]] | None = None
+        self.cvr_mult: dict[str, float] = {}
         self._live_catalog()
+        self.load_bought()
         print(f"predictor ready: {self.VERSION} · {len(self.fs.products):,} products "
               f"({int(self.fs.products.is_active.sum()):,} active)")
 
@@ -116,15 +173,15 @@ class Predictor:
         self._active_list = active.product_id.tolist()
         self._cat_wm = self._max_update_ts()
 
-    def _max_update_ts(self) -> str:
-        """Newest shop.catalog_updates timestamp, as watermark for refresh().
-        Returns the epoch on failure, which just forces a rebuild next time."""
+    def _max_update_ts(self) -> int:
+        """Newest shop.catalog_updates timestamp (unix seconds), watermark for
+        refresh(). Returns 0 on failure, which just forces a rebuild."""
         try:
-            r = self._http.post(f"{self._api}/v1/query", json={"sql": "SELECT toString(max(ts)) AS wm FROM shop.catalog_updates"}, timeout=10)
+            r = self._http.post(f"{self._api}/v1/query", json={"sql": "SELECT max(ts::UInt64) AS wm FROM shop.catalog_updates"}, timeout=10)
             r.raise_for_status()
-            return r.json()["data"][0]["wm"]
+            return int(r.json()["data"][0]["wm"])
         except Exception:
-            return "1970-01-01 00:00:00.000"
+            return 0
 
     def refresh(self) -> None:
         """Cheap periodic refresh for long runs: the trend list is rebuilt from
@@ -135,12 +192,13 @@ class Predictor:
             r = self._http.post(f"{self._api}/v1/query",
                                 json={"sql": CATALOG_WM_SQL.format(since=self._cat_wm)}, timeout=10)
             r.raise_for_status()
-            wm = r.json()["data"][0]["wm"]
+            row = r.json()["data"][0]
+            if int(row["n"]) > 0:
+                self._live_catalog()
+                self._cat_wm = int(row["mx"])
         except Exception:
-            wm = None  # watermark lost: be safe and rebuild the catalogue
-        if wm is None or wm > self._cat_wm:
-            self._live_catalog()
-            self._cat_wm = wm if wm is not None else self._max_update_ts()
+            self._live_catalog()  # watermark lost: be safe and rebuild
+            self._cat_wm = self._max_update_ts()
         r = self._http.post(f"{self._api}/v1/query", json={"sql": TRENDS_SQL}, timeout=60)
         r.raise_for_status()
         live = pd.DataFrame(r.json()["data"])
@@ -153,6 +211,85 @@ class Predictor:
         m["purchase_lift"] = m.purchases_24h / (m.purchases_hist / 60).replace(0, np.nan)
         self.fs.trends = m.sort_values("purchase_lift", ascending=False)
         self.fs.trend = self.fs.trends[self.fs.trends.views_24h >= 20].product_id.head(120).tolist()
+
+    def _max_purchase_ts(self) -> int:
+        """Newest live purchase timestamp (unix seconds), watermark for
+        add_purchases(). Returns 0 on failure, which just re-reads more."""
+        try:
+            r = self._http.post(f"{self._api}/v1/query",
+                                json={"sql": "SELECT max(ts::UInt64) AS wm FROM shop.events WHERE event_type::String = 'purchase'"},
+                                timeout=10)
+            r.raise_for_status()
+            return int(r.json()["data"][0]["wm"])
+        except Exception:
+            return 0
+
+    def load_bought(self) -> None:
+        """One-time map of every shopper's already-bought products (history).
+        The simulator makes repeat purchases unlikely, so a recommended
+        product the shopper owns wastes a slot. On failure the map stays None
+        (no exclusion) and the next add_purchases() retries the full load."""
+        try:
+            r = self._http.post(f"{self._api}/v1/query", json={"sql": BOUGHT_SQL}, timeout=120)
+            r.raise_for_status()
+            self.bought = {row["user_id"]: set(row["pids"]) for row in r.json()["data"]}
+            self._purch_wm = self._max_purchase_ts()
+        except Exception as e:
+            self.bought = None
+            print(f"bought-map load failed ({e}); will retry on the next tick")
+
+    def add_purchases(self) -> None:
+        """Fold live purchases (shop.events watermark deltas) into the bought
+        map, so a shopper who just bought something stops being shown it."""
+        if self.bought is None:
+            self.load_bought()
+            if self.bought is None:
+                return
+        r = self._http.post(f"{self._api}/v1/query",
+                            json={"sql": LIVE_PURCHASES_SQL.format(since=self._purch_wm)}, timeout=30)
+        r.raise_for_status()
+        rows = r.json()["data"]
+        for row in rows:
+            self.bought.setdefault(row["user_id"], set()).add(row["product_id"])
+        if rows:
+            self._purch_wm = max(int(row["ts"]) for row in rows)
+
+    CVR_SHRINK = 20
+    """Pseudo-count pulling small-sample conversion towards the overall rate."""
+    CVR_ALPHA = 1.0
+    """Strength of the empirical-vs-model correction (1 = gentle)."""
+
+    def refresh_feedback(self) -> None:
+        """Empirical per-product conversion from our own served traffic
+        (team feedback), shrunk towards the overall rate and turned into a
+        multiplicative score factor. Products the simulator likes more than
+        the model predicts get shown more, which also sharpens the estimate:
+        a soft bandit over the recommendation policy."""
+        r = self._http.post(f"{self._api}/v1/query", json={"sql": CVR_SQL.format(team=TEAM)}, timeout=60)
+        r.raise_for_status()
+        rows = r.json()["data"]
+        shown = sum(row["shown"] for row in rows)
+        bought = sum(row["bought"] for row in rows)
+        if shown < 500 or bought <= 0:
+            return  # not enough signal yet
+        overall = bought / shown
+        mult = {}
+        for row in rows:
+            s, b = row["shown"], row["bought"]
+            cvr = (b + self.CVR_SHRINK * overall) / (s + self.CVR_SHRINK)
+            mult[row["product_id"]] = float(
+                np.clip(1 + self.CVR_ALPHA * (cvr - overall) / overall, 0.6, 1.6))
+        self.cvr_mult = mult
+
+    def refresh_cov(self) -> None:
+        """Rebuild the live co-visitation dict (last 24 h of shop.events) used
+        as an extra candidate source in _candidates."""
+        r = self._http.post(f"{self._api}/v1/query", json={"sql": LIVE_COV_SQL}, timeout=120)
+        r.raise_for_status()
+        cov: dict[str, dict[str, int]] = {}
+        for row in r.json()["data"]:
+            cov.setdefault(row["p"], {})[row["q"]] = int(row["n"])
+        self.fs.cov_live = cov
 
     def _base_row(self, req: dict) -> dict:
         """Session features straight from the raw request record."""
@@ -171,10 +308,10 @@ class Predictor:
 
     def _candidates(self, row: dict, unavailable: set) -> list:
         """Candidate pool for one request: co-view neighbours of every viewed
-        product (all-time and 14-day windows), star products of the viewed and
-        the shopper's favourite categories, trending, best sellers and a few
-        random explorers. Only active, in-stock candidates are accepted, so
-        nothing reaches the scorer just to be dropped later."""
+        product (all-time, 14-day and today's live windows), star products of
+        the viewed and the shopper's favourite categories, trending, best
+        sellers and a few random explorers. Only active, in-stock candidates
+        are accepted, so nothing reaches the scorer just to be dropped later."""
         fs = self.fs
         cands, seen = [], set()
 
@@ -188,11 +325,13 @@ class Predictor:
         for pid in dict.fromkeys([row["last_view"], *row["recent_ids"][:3]]):
             if not pid:
                 continue
-            d1, d2 = fs.cov.get(pid), fs.cov14.get(pid)
+            d1, d2, d3 = fs.cov.get(pid), fs.cov14.get(pid), fs.cov_live.get(pid)
             if d1:
                 add(sorted(d1, key=d1.get, reverse=True)[:50])
             if d2:
                 add(sorted(d2, key=d2.get, reverse=True)[:50])
+            if d3:
+                add(sorted(d3, key=d3.get, reverse=True)[:30])
             cat = cats.get(pid)
             if isinstance(cat, str):
                 add(fs.cat_stars.get(cat, []))
@@ -212,36 +351,37 @@ class Predictor:
 
     def recommend_batch(self, reqs: list[dict], unavailable: set) -> dict:
         """Score every request's candidates and return the 10 best product ids
-        per request_id. When the pool leaves the list short, next-best scored
-        candidates fill it before best sellers do."""
+        per request_id. Model scores are multiplied by the empirical-feedback
+        factor (cvr_mult), products the shopper already bought are skipped,
+        and the list fills greedily from the best score down, then from best
+        sellers if the pool runs short."""
         rows = [self._base_row(r) for r in reqs]
         ids = [r["request_id"] for r in rows]
+        uid = {r["request_id"]: r["user_id"] for r in rows}
         reqs_df = pd.DataFrame(rows)
         base = session_base(reqs_df, self.fs).set_axis(pd.Index(ids, name="request_id"))
         cands = {rid: self._candidates(row, unavailable) for row, rid in zip(rows, ids)}
         slots = pd.DataFrame([(rid, p) for rid in ids for p in cands[rid]],
                              columns=["request_id", "pid"])
         out = {rid: [] for rid in ids}
+        bought = self.bought or {}
         if len(slots):
             j = attach_candidates(base, slots, self.fs)
             X = feature_matrix(j, self.cats)
-            scores = self._score(X)
-            j["score"] = scores
+            j["score"] = self._score(X) * j.pid.map(self.cvr_mult).fillna(1.0)
             for rid, g in j.groupby("request_id", sort=False):
-                order = g.sort_values("score", ascending=False, na_position="last")
-                ranked = [str(p) for p in order.pid.head(10).tolist()]
-                for p in order.pid.iloc[10:]:  # scored extras beat best-seller filler
+                order = list(g.sort_values("score", ascending=False, na_position="last").pid)
+                ranked, taken = [], set()
+                mine = bought.get(uid[rid], ())
+                for p in order + self.fs.best:  # scored extras, then best-seller filler
                     p = str(p)
-                    if len(ranked) >= 10:
+                    if p in taken or p in unavailable or p in mine:
+                        continue
+                    taken.add(p)
+                    ranked.append(p)
+                    if len(ranked) == 10:
                         break
-                    if p not in ranked and p not in unavailable:
-                        ranked.append(p)
-                for p in self.fs.best:  # safety net if the pool is tiny
-                    if len(ranked) >= 10:
-                        break
-                    if p not in ranked and p not in unavailable:
-                        ranked.append(p)
-                out[rid] = ranked[:10]
+                out[rid] = ranked
         return out
 
     def recommend(self, req: dict, unavailable: set = frozenset()) -> list:

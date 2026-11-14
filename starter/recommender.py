@@ -64,13 +64,16 @@ HAVING argMax(change::String, ts::DateTime64(3)) = 'out_of_stock'"""
 and as fallback; afterwards deltas keep the set current (see StockTracker)."""
 
 STOCK_DELTA = """
-SELECT product_id::String AS product_id, change::String AS change, toString(ts) AS ts
+SELECT product_id::String AS product_id, change::String AS change, ts::UInt64 AS ts
 FROM shop.catalog_updates
-WHERE ts > toDateTime64('{since}', 3) AND change::String IN ('out_of_stock', 'back_in_stock')
+WHERE ts::UInt64 >= {since} AND change::String IN ('out_of_stock', 'back_in_stock')
 ORDER BY ts"""
-"""Stock changes since a watermark timestamp. Applying a handful of rows is
-much cheaper than re-scanning the whole update log every second, and the set
-reacts to 'back_in_stock' within a second (fewer invalid answers)."""
+"""Stock changes since a watermark (epoch seconds; RawTree's ts is a String
+of unix seconds, so compare as integers). Applying a handful of rows is much
+cheaper than re-scanning the whole update log every second, and the set
+reacts to 'back_in_stock' within a second (fewer invalid answers). The >=
+re-delivers the boundary second, which is harmless: changes are idempotent
+and rows arrive ordered, so the latest change always wins."""
 
 Record = dict[str, Any]
 """RawTree returns rows as JSON objects: {"column": value, ...}"""
@@ -113,7 +116,7 @@ class StockTracker:
     def reseed(self) -> None:
         """Full scan (also the fallback after any delta error)."""
         self.state["unavailable"] = out_of_stock()
-        self.since = query("SELECT toString(max(ts)) AS wm FROM shop.catalog_updates")[0]["wm"]
+        self.since = int(query("SELECT max(ts::UInt64) AS wm FROM shop.catalog_updates")[0]["wm"])
 
     def update(self) -> None:
         """Apply the stock changes since the last watermark."""
@@ -131,7 +134,7 @@ class StockTracker:
             for r in rows:
                 (u.add if r["change"] == "out_of_stock" else u.discard)(r["product_id"])
             self.state["unavailable"] = u
-            self.since = rows[-1]["ts"]
+            self.since = int(rows[-1]["ts"])
 
 
 def pull(seen: set[str]) -> list[Record]:
@@ -180,24 +183,37 @@ CHUNK = 10
 requests of a poll never wait for the featurizing of the last ones."""
 
 
+JOBS = [
+    ("purchases", 2, lambda: _pred.add_purchases()),
+    ("signals", 60, lambda: _pred.refresh()),
+    ("cov_live", 120, lambda: _pred.refresh_cov()),
+    ("feedback", 300, lambda: _pred.refresh_feedback()),
+]
+"""Background refresh jobs for the model: (name, period_s, call). Each runs
+in the maintainer thread, never on the answering path."""
+
+
 def maintainer(state: dict) -> None:
-    """Background thread for the queries that do not have to block answering:
-    the stock set (watermark deltas, every second) and the model's catalogue /
-    trend signals (every minute). Failures keep the last known values; the
-    answering loop only ever reads the shared dict."""
-    signal_t = 0.0
+    """Background thread for everything that does not have to block answering:
+    the stock set (watermark deltas, every second) and the model's feedback
+    loops (catalogue/trends, live co-views, empirical conversion factors,
+    live purchases). Failures keep the last known values; the answering loop
+    only ever reads the shared dict."""
     stock = StockTracker(state)
+    last: dict[str, float] = {}
     while True:
         now = time.time()
         stock.update()
-        try:
-            if _pred is not None and now - signal_t >= 60:
-                signal_t = now
-                _pred.refresh()
-        except Exception as e:
-            print(f"signal refresh failed ({e}); keeping last known signals")
-        time.sleep(0.2)
-
+        if _pred is not None:
+            for name, period, job in JOBS:
+                if now - last.get(name, 0.0) >= period:
+                    last[name] = now
+                    try:
+                        job()
+                    except Exception as e:
+                        print(f"{name} refresh failed ({e})")
+        time.sleep(0.5)
+ 
 
 def main() -> None:
     """pull → predict → push forever. All RawTree maintenance (stock, catalogue,
