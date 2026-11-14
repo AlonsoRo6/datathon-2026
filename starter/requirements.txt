@@ -1,4 +1,9 @@
 requests
 pandas
 numpy
+scipy
+scikit-learn
+lightgbm
+joblib
+matplotlib
 jupyter

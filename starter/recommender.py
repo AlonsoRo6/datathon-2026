@@ -10,6 +10,7 @@ missing, late or invalid (the fallback).
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,18 @@ TEAM = os.environ["TEAM_ID"]
 http = requests.Session()
 http.headers["Authorization"] = f"Bearer {os.environ['RAWTREE_API_KEY']}"
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+try:
+    from model.predictor import Predictor
+    _pred = Predictor()
+    MODEL_VERSION = _pred.VERSION
+except Exception as e:
+    _pred = None
+    MODEL_VERSION = "baseline"
+    print(f"model not loaded ({e}); answering with the best-seller fallback")
+
 SALES = """
 SELECT product_id, count() AS n
 FROM shop.history_events
@@ -32,7 +45,7 @@ GROUP BY product_id"""
 """How many times each product was bought in the historical events."""
 
 NEW_REQUESTS = """
-SELECT request_id, recent_views
+SELECT request_id, ts, user_id, is_new_user, context, recent_views
 FROM shop.requests
 ORDER BY ts DESC
 LIMIT 50"""
@@ -84,9 +97,22 @@ def pull(seen: set[str]) -> list[Record]:
 
 def predict(requests: list[Record], best: list[str], unavailable: set[str]) -> list[Record]:
     """One submission per request."""
-    return [{"request_id": req["request_id"],
-             "items": recommend(req["recent_views"], best, unavailable),
-             "model_version": "baseline"} for req in requests]
+    answers = []
+    model_items: dict[str, list[str]] = {}
+    if _pred is not None and requests:
+        try:
+            model_items = _pred.recommend_batch(requests, unavailable)
+        except Exception as e:
+            print(f"model batch failed ({e}); falling back to best sellers")
+            model_items = {}
+    for req in requests:
+        items = model_items.get(req["request_id"])
+        version = MODEL_VERSION
+        if not items or len(items) != 10:
+            items = recommend(req.get("recent_views") or [], best, unavailable)
+            version = "baseline"
+        answers.append({"request_id": req["request_id"], "items": items, "model_version": version})
+    return answers
 
 
 def recommend(recent_views: list[Record], best: list[str], unavailable: set[str] = frozenset()) -> list[str]:

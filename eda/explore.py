@@ -2,6 +2,7 @@
 
     python eda/explore.py            # all sections
     python eda/explore.py --no-live  # skip live tables
+    python eda/explore.py features   # visualize the engineered feature tables
 
 Read-only: every aggregation runs as SQL in RawTree, Python only plots.
 Outputs: CSVs in eda/out/, one interactive figure per section (nothing stored).
@@ -271,7 +272,89 @@ def live() -> None:
 # interactive figure: shown by plt.show() at the end of the run
 
 
-SECTIONS = [catalogue, sessions, events, live]
+def features() -> None:
+    import scipy.sparse as sp
+
+    FEAT = ROOT / "features" / "out"
+    needed = ["product_stats", "ctx_last_view_category", "coviews", "coviews_14d",
+              "user_stats", "trends_subcategory"]
+    missing = [n for n in needed if not (FEAT / f"{n}.csv.gz").exists()]
+    if missing:
+        print(f"  run features/build_features.py first — missing {missing}")
+        return
+    ps = pd.read_csv(FEAT / "product_stats.csv.gz")
+    lastcat = pd.read_csv(FEAT / "ctx_last_view_category.csv.gz")
+    cov = pd.read_csv(FEAT / "coviews.csv.gz")
+    cov14 = pd.read_csv(FEAT / "coviews_14d.csv.gz")
+    users = pd.read_csv(FEAT / "user_stats.csv.gz")
+    trend = pd.read_csv(FEAT / "trends_subcategory.csv.gz")
+
+    fig, A = plt.subplots(2, 3, figsize=(18, 9))
+    (a1, a2, a3), (a4, a5, a6) = A
+    fig.suptitle("5 · Engineered features (features/out) — what the model will see",
+                 fontsize=14, fontweight="bold")
+
+    wide = lastcat.pivot(index="last_view_category", columns="page", values="conv_pct")
+    wide = wide.reindex(wide["product"].sort_values().index)
+    wide.plot.bar(ax=a1, width=0.75)
+    a1.axhline(1.4, ls="--", c="k", lw=1)
+    a1.text(8.3, 1.5, "store average 1.4%", fontsize=8)
+    a1.set_ylabel("conversion %")
+    a1.set_title("A · Intent feature: conversion by LAST-VIEWED product's category\n(from 0.15% 'browsing' to 4.2% 'Buying mood')")
+    a1.tick_params(axis="x", labelsize=8, rotation=45)
+
+    best = ps.loc[ps.purchases.idxmax()]
+    c60 = cov[cov.p == best.product_id].nlargest(10, "n") \
+        .merge(ps[["product_id", "subcategory"]], left_on="q", right_on="product_id", how="left")
+    c14 = cov14[cov14.p == best.product_id].set_index("q")
+    pair = pd.DataFrame({"60 days": c60.n.values,
+                         "last 14 days": c60.q.map(c14.n).fillna(0).values},
+                        index=[f"{s} · {q}" for s, q in zip(c60.subcategory.fillna('?'), c60.q)])
+    pair[::-1].plot.barh(ax=a2, color={"60 days": "#4a72b0", "last 14 days": "#dd8452"})
+    a2.legend(fontsize=8)
+    a2.set_title(f"B · Retrieval feature: 'also viewed' for the top seller\n{best.product_id} ({best.subcategory}, {best.purchases:,} purchases)")
+
+    t10 = trend.nlargest(10, "purchase_lift")[::-1]
+    a3.barh(t10.subcategory, t10.purchase_lift, color="#c44e52")
+    a3.set_xlabel("lift = live 24h rate ÷ 60-day daily average")
+    a3.set_title("C · Dynamics feature: subcategories trending RIGHT NOW")
+    for y, v in enumerate(t10.purchase_lift):
+        a3.text(v + 0.1, y, f"{v:.1f}x", va="center", fontsize=8)
+
+    a4.scatter(ps.views, ps.purchases, s=5, alpha=0.35, color="#4a72b0")
+    hot = ps.nlargest(20, "purchases")
+    a4.scatter(hot.views, hot.purchases, s=12, color="#c44e52", label="top-20 sellers")
+    a4.set_xscale("log")
+    a4.set_yscale("log")
+    a4.set_xlabel("views (60d)")
+    a4.set_ylabel("purchases (60d)")
+    a4.legend(fontsize=8)
+    a4.set_title("D · Attractiveness feature: product funnel spread\n(same views can convert very differently — that's the model's room)")
+
+    a5.hist(users.buys, bins=60, color="#55a868")
+    a5.set_yscale("log")
+    a5.set_xlabel("purchases per user (60 days)")
+    a5.set_ylabel("users (log)")
+    a5.set_title(f"E · User feature: {len(users):,} returning shoppers\nmedian {users.buys.median():.0f} buys · blank for the 30% new users → NaN-tolerant")
+
+    x = sp.load_npz(FEAT / "text_tfidf.npz")
+    ids = pd.read_csv(FEAT / "text_tfidf_ids.csv").product_id.values
+    rng = np.random.default_rng(0)
+    lines = []
+    for i in sorted(rng.choice(len(ids), 3, replace=False)):
+        sims = (x[i] @ x.T).toarray().ravel()
+        sims[i] = -1
+        top = sims.argsort()[::-1][:3]
+        lines.append(f"{ids[i]} [{ps.subcategory.iloc[i]}]")
+        lines += [f"   → {ids[j]} [{ps.subcategory.iloc[j]}]  cos={sims[j]:.2f}" for j in top]
+    a6.axis("off")
+    a6.text(0.02, 0.95, "\n".join(lines), va="top", family="monospace", fontsize=9)
+    a6.set_title("F · Cold-start feature: description tf-idf nearest neighbours\n(new products rank by text similarity — sanity check above)")
+
+    fig.tight_layout()
+
+
+SECTIONS = [catalogue, sessions, events, live, features]
 
 
 def main() -> None:
