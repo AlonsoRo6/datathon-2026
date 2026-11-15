@@ -63,6 +63,11 @@ def product_stats() -> None:
                      uniqExact(user_id::String)                AS buyers,
                      max(ts::DateTime64(3))                    AS last_event_ts
               FROM shop.history_events GROUP BY product_id""")
+    cut = q("SELECT toString(toDate(max(ts::DateTime64(3)) - INTERVAL 14 DAY)) AS cut FROM shop.history_events").cut[0]
+    rec = q(f"""SELECT product_id::String AS product_id,
+                       countIf(event_type::String='purchase') AS purchases_14d
+                FROM shop.history_events WHERE ts::DateTime64(3) >= toDateTime64('{cut}', 3)
+                GROUP BY product_id""")
     cat_demand = q("""SELECT c.category::String AS category,
                              countIf(e.event_type::String='purchase') AS cat_purchases,
                              countIf(e.event_type::String='view')     AS cat_views
@@ -70,9 +75,12 @@ def product_stats() -> None:
                       INNER JOIN shop.catalog c ON c.product_id::String = e.product_id::String
                       GROUP BY category""")
     df = (cat.merge(ev, on="product_id", how="left")
+             .merge(rec, on="product_id", how="left")
              .merge(cat_demand, on="category", how="left"))
     for c in ["views", "carts", "purchases", "buyers", "cat_purchases", "cat_views"]:
         df[c] = df[c].fillna(0).astype(int)
+    df["purchases_14d"] = df.purchases_14d.fillna(0).astype(int)
+    df["purchases_14d_log"] = np.log1p(df.purchases_14d)
     df["purchase_rate"] = df.purchases / (df.views + 1)
     df["cart_rate"] = df.carts / (df.views + 1)
     df["price_vs_subcat"] = df.groupby("subcategory").price.transform(lambda s: (s - s.mean()) / (s.std() + 1e-9))
@@ -80,6 +88,25 @@ def product_stats() -> None:
     df["cat_sales_share"] = df.purchases / (df.cat_purchases + 1)
     save(df, "product_stats")
     print(f"  sample features: {list(df.columns)}")
+
+
+def cobuys() -> None:
+    print("  bought-together affinity (purchases by the same user)...")
+    cob = q("""
+        SELECT p, q, count() AS n
+        FROM (
+            SELECT user_id::String AS uid, product_id::String AS p
+            FROM shop.history_events WHERE event_type::String='purchase'
+        ) a
+        INNER JOIN (
+            SELECT user_id::String AS uid, product_id::String AS q
+            FROM shop.history_events WHERE event_type::String='purchase'
+        ) b ON a.uid = b.uid AND a.p != b.q
+        GROUP BY p, q
+        ORDER BY n DESC
+        LIMIT 30 BY p""")
+    save(cob, "cobuys")
+    print(f"  {cob.p.nunique():,} products with bought-together neighbours")
 
 
 def session_context() -> None:
@@ -220,7 +247,7 @@ def text_tfidf() -> None:
     print(f"  saved text_tfidf.npz  ({x.shape[0]:,} products × {x.shape[1]:,} tf-idf features)")
 
 
-SECTIONS = [product_stats, session_context, coviews, user_stats, trends, text_tfidf]
+SECTIONS = [product_stats, session_context, coviews, cobuys, user_stats, trends, text_tfidf]
 
 
 def main() -> None:

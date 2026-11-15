@@ -26,8 +26,9 @@ FEATURES_OUT = Path(__file__).resolve().parent.parent / "features" / "out"
 NUMERIC = ["n_views", "hour", "has_user", "user_buys", "user_avg_price", "user_top_share",
            "ctx_page_device", "ctx_page_lastcat", "price", "purchase_rate", "cart_rate",
            "buyers", "subcat_sales_rank", "cat_sales_share", "price_vs_subcat",
-           "cov_n", "cov_n14", "text_cos", "price_ratio_user",
-           "same_cat_last", "same_sub_last", "seen_before", "user_top_match"]
+           "cov_n", "cov_n14", "text_cos", "text_cos_mean", "price_ratio_user",
+           "same_cat_last", "same_sub_last", "seen_before", "user_top_match",
+           "cobuy_n", "purchases_14d_log", "slot"]
 
 CATEGORICAL = ["page", "device", "region", "last_view_cat", "cand_cat", "user_top_cat"]
 
@@ -51,6 +52,11 @@ class FeatureStore:
     """Live co-visitation from the last 24 h of shop.events (Predictor
     .refresh_cov()): product -> neighbour -> count, used as an extra candidate
     source so neighbourhoods track today's taste."""
+    cobuy: dict = field(default_factory=dict, init=False)
+    """Bought-together affinity: products purchased by the same user
+    (product -> neighbour -> count), a stronger intent signal than co-views."""
+    cobuy_top: dict = field(default_factory=dict, init=False)
+    """Top-N bought-together neighbours per product, for candidate generation."""
     pidx: pd.DataFrame = field(default_factory=pd.DataFrame, init=False)
     """products indexed by product_id: built once at load time and reused by
     every scoring component instead of rebuilding the index per request."""
@@ -82,6 +88,12 @@ class FeatureStore:
         fs.trends = rd("trends_product")
         t = fs.trends.sort_values("purchase_lift", ascending=False)
         fs.trend = t[t.views_24h >= 20].product_id.head(120).tolist()
+        cob_path = FEATURES_OUT / "cobuys.csv.gz"
+        if cob_path.exists():
+            cob = rd("cobuys")
+            fs.cobuy = {p: dict(zip(g.q, g.n)) for p, g in cob.groupby("p")}
+            fs.cobuy_top = {p: list(g.sort_values("n", ascending=False).q.head(20))
+                            for p, g in cob.groupby("p")}
         fs.pidx = fs.products.set_index("product_id")
         return fs
 
@@ -130,22 +142,26 @@ def attach_candidates(base: pd.DataFrame, slots: pd.DataFrame, fs: FeatureStore)
     df = slots.reset_index(drop=True).merge(base.reset_index(names="rid"),
                                             left_on="request_id", right_on="rid", how="left")
     j = df.merge(ps[["category", "subcategory", "brand", "price", "purchase_rate", "cart_rate",
-                     "buyers", "subcat_sales_rank", "cat_sales_share", "price_vs_subcat"]],
+                     "buyers", "subcat_sales_rank", "cat_sales_share", "price_vs_subcat",
+                     "purchases_14d_log"]],
                  left_on="pid", right_index=True, how="left")
     j["cand_cat"] = pd.Categorical(j["category"], categories=sorted(ps["category"].dropna().unique()))
     j.drop(columns=["category"], inplace=True)
 
-    cov_n, cov_n14 = np.zeros(len(j), "float32"), np.zeros(len(j), "float32")
+    cov_n, cov_n14, cob_n = (np.zeros(len(j), "float32") for _ in range(3))
     lv = j.last_view.to_numpy()
     pid = j.pid.to_numpy()
     for i in range(len(j)):
-        d1, d2 = fs.cov.get(lv[i]), fs.cov14.get(lv[i])
+        d1, d2, d3 = fs.cov.get(lv[i]), fs.cov14.get(lv[i]), fs.cobuy.get(lv[i])
         if d1 is not None:
             cov_n[i] = d1.get(pid[i], 0)
         if d2 is not None:
             cov_n14[i] = d2.get(pid[i], 0)
+        if d3 is not None:
+            cob_n[i] = d3.get(pid[i], 0)
     j["cov_n"] = np.log1p(cov_n)
     j["cov_n14"] = np.log1p(cov_n14)
+    j["cobuy_n"] = np.log1p(cob_n)
 
     lv_cat = pd.Series(lv).map(ps["category"])
     lv_sub = pd.Series(lv).map(ps["subcategory"])
@@ -161,9 +177,33 @@ def attach_candidates(base: pd.DataFrame, slots: pd.DataFrame, fs: FeatureStore)
                                    (j.user_top_cat.astype(str) == j.cand_cat.astype(str)).astype("float32"))
     j["price_ratio_user"] = j.price / j.user_avg_price
     j["text_cos"] = _text_cos(j, fs) if fs.tfidf is not None else np.nan
+    j["text_cos_mean"] = _text_cos_mean(j, fs) if fs.tfidf is not None else np.nan
     if "slot" not in j:
         j["slot"] = 1
     return j
+
+
+def _text_cos_mean(j: pd.DataFrame, fs: FeatureStore) -> np.ndarray:
+    """Cosine similarity between each candidate and the MEAN vector of the
+    session's viewed products — multi-view sessions get a fuller intent
+    vector than the last-view-only signal."""
+    out = np.full(len(j), np.nan, dtype="float32")
+    cand_rows = j.pid.map(fs.pid_row).to_numpy(dtype="float64")
+    rsets = j.drop_duplicates("request_id").set_index("request_id").recent_ids.map(list)
+    rid_arr = j.request_id.to_numpy()
+    by_rid = {}
+    for i, rid in enumerate(rid_arr):
+        rows = [fs.pid_row[p] for p in rsets.get(rid, []) if p in fs.pid_row]
+        if rows:
+            by_rid.setdefault(tuple(sorted(set(rows))), []).append(i)
+    for rows, idxs in by_rid.items():
+        mean_vec = np.asarray(fs.tfidf[list(rows)].mean(axis=0))
+        cand_idx = np.array([i for i in idxs if not np.isnan(cand_rows[i])], dtype=int)
+        if len(cand_idx) == 0:
+            continue
+        sims = (mean_vec @ fs.tfidf[cand_rows[cand_idx].astype(int)].T).ravel()
+        out[cand_idx] = sims
+    return out
 
 
 def _text_cos(j: pd.DataFrame, fs: FeatureStore) -> np.ndarray:

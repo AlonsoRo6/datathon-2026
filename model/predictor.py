@@ -50,14 +50,16 @@ SELECT product_id::String AS product_id,
        argMax(subcategory::String, v) AS subcategory,
        argMax(brand::String, v)       AS brand,
        argMax(price_eur::Float64, v)  AS price,
-       argMax(is_active::Bool, v)     AS is_active
+       argMax(is_active::Bool, v)     AS is_active,
+       argMax(description::String, v) AS description
 FROM (
     SELECT product_id::String AS product_id, category::String AS category, subcategory::String AS subcategory,
-           brand::String AS brand, price_eur::Float64 AS price_eur, is_active::Bool AS is_active, '' AS v
+           brand::String AS brand, price_eur::Float64 AS price_eur, is_active::Bool AS is_active,
+           description::String AS description, '' AS v
     FROM shop.catalog
     UNION ALL
     SELECT product_id::String, category::String, subcategory::String, brand::String,
-           price_eur::Float64, is_active::Bool, toString(ts)
+           price_eur::Float64, is_active::Bool, description::String, toString(ts)
     FROM shop.catalog_updates
 )
 GROUP BY product_id"""
@@ -137,11 +139,18 @@ class Predictor:
             import lightgbm as lgb
             self.model = lgb.Booster(model_file=str(lgb_path))
             self.backend = "lightgbm"
-            self.VERSION = "pchavarria-v4"
+            self.VERSION = "ensemble-v3"
         else:
             self.model = joblib.load(d / "model.joblib")
             self.backend = "sklearn-histgb"
             self.VERSION = "gbdt-v1"
+        self.xgb = None
+        xgb_path = d / self.meta.get("xgb_file", "model_xgb.json")
+        if xgb_path.name and xgb_path.exists():
+            import xgboost as xgboost_lib
+            self.xgb = xgboost_lib.XGBClassifier()
+            self.xgb.load_model(str(xgb_path))
+            self.VERSION = "ensemble-v3"
         self.fs = FeatureStore.load()
         self._api = api or os.environ.get("RAWTREE_API_URL", "https://api.rawtree.com")
         self._http = requests.Session()
@@ -159,9 +168,27 @@ class Predictor:
         r.raise_for_status()
         live = pd.DataFrame(r.json()["data"])
         stats = self.fs.products.set_index("product_id")
+        # new products = present in the live catalogue but without history stats
+        new_ids = set(live.product_id) - set(stats.index)
         m = live.set_index("product_id").join(
             stats[["purchase_rate", "cart_rate", "buyers", "subcat_sales_rank",
-                   "cat_sales_share", "price_vs_subcat"]], how="left")
+                   "cat_sales_share", "price_vs_subcat", "purchases_14d_log"]], how="left")
+        if new_ids:
+            is_new = pd.Series(m.index.isin(new_ids), index=m.index)
+            pr_cat = m.groupby("category").purchase_rate.transform("mean")
+            cr_cat = m.groupby("category").cart_rate.transform("mean")
+            # probation floor: new products start at 70% of their category's
+            # average conversion instead of a flat 0
+            m.loc[is_new, "purchase_rate"] = 0.7 * pr_cat[is_new]
+            m.loc[is_new, "cart_rate"] = 0.7 * cr_cat[is_new]
+            m.loc[is_new, ["buyers", "subcat_sales_rank", "cat_sales_share", "price_vs_subcat"]] = np.nan
+        self.fs.new_set = set(new_ids) & set(m.index)
+        tt = getattr(self.fs, "trends", pd.DataFrame())
+        att = tt.set_index("product_id").views_24h.reindex(m.index).fillna(0) \
+            if "views_24h" in tt.columns else pd.Series(0.0, index=m.index)
+        active_ids = set(m[m.is_active == True].index)
+        self.fs.new_sorted = sorted(self.fs.new_set & active_ids,
+                                    key=lambda p: -float(att.get(p, 0)))
         self.fs.products = m.reset_index()
         self.fs.pidx = self.fs.products.set_index("product_id")
         active = self.fs.products[self.fs.products.is_active == True]
@@ -322,32 +349,57 @@ class Predictor:
                     cands.append(p)
 
         cats = fs.pidx["category"]
+        add(row["recent_ids"])          # 'buy what you just viewed' (5.9% of all purchases)
         for pid in dict.fromkeys([row["last_view"], *row["recent_ids"][:3]]):
             if not pid:
                 continue
             d1, d2, d3 = fs.cov.get(pid), fs.cov14.get(pid), fs.cov_live.get(pid)
+            d4 = fs.cobuy_top.get(pid)
             if d1:
                 add(sorted(d1, key=d1.get, reverse=True)[:50])
             if d2:
                 add(sorted(d2, key=d2.get, reverse=True)[:50])
             if d3:
                 add(sorted(d3, key=d3.get, reverse=True)[:30])
+            if d4:
+                add(d4[:15])            # bought-together neighbours
             cat = cats.get(pid)
             if isinstance(cat, str):
                 add(fs.cat_stars.get(cat, []))
-        u = fs.user_by_id.get(row["user_id"])
-        if u is not None and isinstance(getattr(u, "top_category", None), str):
-            add(fs.cat_stars.get(u.top_category, []))
+        touched_new = [p for p in row["recent_ids"] if p in fs.new_set]
+        if touched_new:
+            tsets = {cats.get(p) for p in touched_new}
+            add([p for p in fs.new_sorted if cats.get(p) in tsets][:15])
+        add(fs.new_sorted[:8])          # small global exploration budget
         add(fs.trend[:150])
         add(fs.best[:80])
         add(list(self.rng.choice(self._active_list, size=20, replace=False)))
         return cands[:400]
 
     def _score(self, X) -> np.ndarray:
-        """Raw model score per candidate row (higher = more likely bought)."""
-        if self.backend == "lightgbm":
-            return self.model.predict(X)
-        return self.model.predict_proba(X)[:, 1]
+        """Raw model score per candidate row (higher = more likely bought).
+        Ensemble: mean of the LightGBM and XGBoost probabilities when both
+        are available."""
+        s = self.model.predict(X) if self.backend == "lightgbm" else self.model.predict_proba(X)[:, 1]
+        if getattr(self, "xgb", None) is not None:
+            s = (s + self.xgb.predict_proba(X)[:, 1]) / 2
+        return s
+
+    def refresh_tfidf(self) -> None:
+        """Rebuild description tf-idf over the CURRENT catalogue so text
+        similarity covers products added mid-event (30-minute cadence)."""
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.preprocessing import normalize
+            m = self.fs.products
+            vec = TfidfVectorizer(ngram_range=(1, 2), min_df=2, sublinear_tf=True,
+                                  stop_words="english", max_features=30000)
+            x = normalize(vec.fit_transform(m["description"].fillna("")))
+            self.fs.tfidf = x
+            self.fs.tfidf_ids = m.product_id.to_numpy()
+            self.fs.pid_row = {p: i for i, p in enumerate(self.fs.tfidf_ids)}
+        except Exception as e:
+            print(f"tfidf rebuild failed ({e}); keeping previous vectors")
 
     def recommend_batch(self, reqs: list[dict], unavailable: set) -> dict:
         """Score every request's candidates and return the 10 best product ids
