@@ -90,17 +90,15 @@ def catalogue() -> None:
     brands = q("""SELECT brand::String AS brand, count() AS n FROM shop.catalog
                   GROUP BY brand ORDER BY n DESC LIMIT 15""")
     save(brands, "catalog_brands")
-    a.text(0.5, 0.5, f"{brands.n.iloc[0]} products / top brand\n"
-                     f"{brands.brand.nunique()} brands in top 15 of {q('SELECT uniqExact(brand::String) AS n FROM shop.catalog').n[0]} total\n\n"
-                     f"descriptions: one or two sentences (raw text for embeddings)\ncreated_at spans 2025-01 .. 2026-11",
-           ha="center", va="center", fontsize=12)
-    a.set_title("D · top-15 brands by catalogue size")
-    b = brands[::-1].plot.barh(x="brand", y="n", legend=False, ax=a.twinx(), color="#55a868")
-    b.get_legend().remove() if b.get_legend() else None
-    a.axis("off")
+    total_brands = q("SELECT uniqExact(brand::String) AS n FROM shop.catalog").n[0]
+    brands[::-1].plot.barh(x="brand", y="n", legend=False, ax=a, color="#55a868")
+    a.set_title(f"D · Top-15 brands by catalogue size ({total_brands} total)")
+    a.set_xlabel("Number of products · Text descriptions: 1–2 sentences")
+    a.set_ylabel("")
+    a.set_xlim(0, max(brands.n) * 1.15)
+    annotate_bars(a)
 
 # interactive figure: shown by plt.show() at the end of the run
-
 
 def sessions() -> None:
     t0 = q("""SELECT count() AS n, countIf(clicked != '') AS clicks, countIf(purchased != '') AS purchases,
